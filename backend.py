@@ -250,6 +250,17 @@ ANALYZER_MODEL = "gemma4:e2b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 
+def _is_chat_eligible(cart: dict) -> bool:
+    """Returns False for cartridges that should never handle user chat."""
+    cart_roles = set(cart.get("roles", []))
+    return not (cart_roles <= {"memory", "classify"})
+
+
+def get_chat_cartridges(enabled_cartridges: dict[str, dict]) -> dict[str, dict]:
+    """Filter to only cartridges eligible for chat responses."""
+    return {name: cart for name, cart in enabled_cartridges.items() if _is_chat_eligible(cart)}
+
+
 def smart_route(
     messages: list[dict],
     enabled_cartridges: dict[str, dict],
@@ -258,12 +269,15 @@ def smart_route(
     Analyze the prompt and pick the best cartridge.
     Returns (cartridge_name, analysis_dict).
     """
+    # Only show chat-eligible cartridges to the analyzer
+    chat_cartridges = get_chat_cartridges(enabled_cartridges)
+
     try:
         analysis = analyze_prompt(
             messages=messages,
             ollama_base_url=OLLAMA_BASE_URL,
             analyzer_model=ANALYZER_MODEL,
-            enabled_cartridges=enabled_cartridges,
+            enabled_cartridges=chat_cartridges,
         )
     except Exception as e:
         print("Prompt analyzer failed, falling back to heuristic:", repr(e))
@@ -272,9 +286,9 @@ def smart_route(
             return "cloud-fast", None
         return "local-default", None
 
-    # If analyzer directly recommends a valid cartridge, use it
+    # If analyzer directly recommends a valid chat cartridge, use it
     rec = analysis.get("recommended_cartridge")
-    if rec and rec in enabled_cartridges:
+    if rec and rec in chat_cartridges:
         return rec, analysis
 
     # Filter cartridges by role match
@@ -282,11 +296,8 @@ def smart_route(
     avoid_roles = set(analysis.get("avoid_roles", []))
 
     candidates = []
-    for name, cart in enabled_cartridges.items():
+    for name, cart in chat_cartridges.items():
         cart_roles = set(cart.get("roles", []))
-        # Skip memory/classify-only cartridges
-        if cart_roles <= {"memory", "classify"}:
-            continue
         # Skip if cartridge has avoided roles
         if cart_roles & avoid_roles:
             continue
@@ -300,7 +311,7 @@ def smart_route(
 
     if not candidates:
         # No role match — pick best general cartridge
-        for name, cart in enabled_cartridges.items():
+        for name, cart in chat_cartridges.items():
             cart_roles = set(cart.get("roles", []))
             if "general" in cart_roles and not cart.get("online_required"):
                 candidates.append((cart.get("priority", 0), name))
@@ -310,7 +321,7 @@ def smart_route(
         if analysis.get("needs_cloud") and GROQ_API_KEY and check_online():
             boosted = []
             for priority, name in candidates:
-                boost = 1000 if enabled_cartridges[name].get("provider") == "groq" else 0
+                boost = 1000 if chat_cartridges[name].get("provider") == "groq" else 0
                 boosted.append((priority + boost, name))
             candidates = boosted
 
