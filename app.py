@@ -361,6 +361,24 @@ def fetch_memories():
     except Exception:
         return []
 
+def fetch_cartridge_names():
+    try:
+        resp = requests.get(f"{BACKEND_URL}/cartridges", timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("cartridges", {})
+        # Filter to enabled, non-memory cartridges for the UI selector
+        names = []
+        for name, cart in data.items():
+            if not cart.get("enabled", True):
+                continue
+            roles = cart.get("roles", [])
+            if set(roles) <= {"memory", "classify"}:
+                continue
+            names.append(name)
+        return names
+    except Exception:
+        return ["cloud-fast", "local-default", "local-heavy"]
+
 with st.sidebar:
     st.subheader("Settings")
 
@@ -370,9 +388,10 @@ with st.sidebar:
         index=0
     )
 
+    available_cartridges = fetch_cartridge_names()
     cartridge = st.selectbox(
         "Cartridge",
-        ["auto", "cloud-fast", "local-default", "local-heavy"],
+        ["auto"] + available_cartridges,
         index=0
     )
 
@@ -463,10 +482,15 @@ if prompt:
             used_cartridge = data.get("cartridge", "unknown")
             fallback = data.get("fallback", False)
             used_memories = data.get("used_memories", [])
+            analysis = data.get("analysis")
 
             placeholder.markdown(content)
 
             badge_text = f"⚡ {provider} · {model} · {used_cartridge}"
+            if analysis:
+                task_type = analysis.get("task_type", "")
+                if task_type:
+                    badge_text += f" · {task_type}"
             if fallback:
                 badge_text += " · fallback"
 

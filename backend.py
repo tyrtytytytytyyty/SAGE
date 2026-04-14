@@ -1,5 +1,6 @@
+import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -7,6 +8,7 @@ from flask import Flask, jsonify, request
 from openai import OpenAI
 
 from memory_engine import MemoryEngine
+from prompt_analyzer import analyze_prompt
 
 # ----------------------------
 # ENV SETUP
@@ -19,6 +21,9 @@ load_dotenv(dotenv_path=ENV_PATH)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b").strip()
+
+SAGE_STATE_DIR = os.path.join(BASE_DIR, "sage_state")
+os.makedirs(SAGE_STATE_DIR, exist_ok=True)
 
 print("Env path:", ENV_PATH)
 print("Env exists:", os.path.exists(ENV_PATH))
@@ -42,27 +47,32 @@ if GROQ_API_KEY:
     )
 
 memory_engine = MemoryEngine(
-    db_path="brain_storage.db",
+    db_path=os.path.join(SAGE_STATE_DIR, "brain_storage.db"),
     memory_model="gemma4:e2b",
 )
 
 # ----------------------------
-# CARTRIDGES
+# CARTRIDGE REGISTRY
 # ----------------------------
-CARTRIDGES = {
-    "cloud-fast": {
-        "provider": "groq",
-        "model": GROQ_MODEL,
-    },
-    "local-default": {
-        "provider": "ollama",
-        "model": OLLAMA_MODEL,
-    },
-    "local-heavy": {
-        "provider": "ollama",
-        "model": "gemma4:31b",
-    },
-}
+CARTRIDGE_REGISTRY_PATH = os.path.join(SAGE_STATE_DIR, "cartridges.json")
+
+
+def load_cartridge_registry(path: str) -> dict[str, dict]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    registry = {}
+    for cart in data.get("cartridges", []):
+        registry[cart["name"]] = cart
+    return registry
+
+
+def get_enabled_cartridges(registry: dict[str, dict]) -> dict[str, dict]:
+    return {name: cart for name, cart in registry.items() if cart.get("enabled", True)}
+
+
+CARTRIDGE_REGISTRY = load_cartridge_registry(CARTRIDGE_REGISTRY_PATH)
+CARTRIDGES = get_enabled_cartridges(CARTRIDGE_REGISTRY)
+print("Loaded cartridges:", list(CARTRIDGES.keys()))
 
 # ----------------------------
 # HELPERS
@@ -142,16 +152,25 @@ def inject_memory_into_messages(messages: list[dict]) -> tuple[list[dict], list[
     return [memory_message] + messages, memory_snippets
 
 
-def call_ollama(messages: list[dict], model: str) -> tuple[str, str, str]:
+def call_ollama(
+    messages: list[dict],
+    model: str,
+    temperature: Optional[float] = None,
+    num_ctx: Optional[int] = 1024,
+) -> tuple[str, str, str]:
+    options: dict[str, Any] = {}
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
+    if temperature is not None:
+        options["temperature"] = temperature
+
     response = requests.post(
         OLLAMA_CHAT_URL,
         json={
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "num_ctx": 1024
-            },
+            "options": options,
         },
         timeout=300,
     )
@@ -165,15 +184,22 @@ def call_ollama(messages: list[dict], model: str) -> tuple[str, str, str]:
     return content, "ollama", model
 
 
-def call_groq(messages: list[dict], model: str) -> tuple[str, str, str]:
+def call_groq(
+    messages: list[dict],
+    model: str,
+    temperature: Optional[float] = 0.7,
+) -> tuple[str, str, str]:
     if groq_client is None:
         raise RuntimeError("GROQ_API_KEY is missing.")
 
-    response = groq_client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.7,
-    )
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    response = groq_client.chat.completions.create(**kwargs)
 
     content = response.choices[0].message.content
     if not content:
@@ -189,40 +215,109 @@ def run_cartridge(cartridge_name: str, messages: list[dict]) -> tuple[str, str, 
     cart = CARTRIDGES[cartridge_name]
     provider = cart["provider"]
     model = cart["model"]
+    defaults = cart.get("defaults", {})
 
     if provider == "groq":
-        return call_groq(messages, model)
+        return call_groq(messages, model, temperature=defaults.get("temperature"))
     if provider == "ollama":
-        return call_ollama(messages, model)
+        return call_ollama(
+            messages, model,
+            temperature=defaults.get("temperature"),
+            num_ctx=defaults.get("num_ctx"),
+        )
 
     raise RuntimeError(f"Unsupported provider: {provider}")
 
 
-def auto_route(messages: list[dict]) -> str:
-    last_user_message = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user_message = m.get("content", "").lower()
-            break
-
-    heavy_keywords = [
-        "finalize",
-        "final",
-        "production",
-        "architecture",
-        "refactor",
-        "optimize",
-        "debug deeply",
-        "large codebase",
+def get_best_cartridge_for_provider(
+    provider: str,
+    enabled_cartridges: dict[str, dict],
+) -> str:
+    matches = [
+        (cart.get("priority", 0), name)
+        for name, cart in enabled_cartridges.items()
+        if cart.get("provider") == provider
+        and "memory" not in cart.get("roles", [])
+        and "classify" not in cart.get("roles", [])
     ]
-
-    if any(k in last_user_message for k in heavy_keywords):
-        return "local-heavy"
-
-    if GROQ_API_KEY and check_online():
-        return "cloud-fast"
-
+    if matches:
+        matches.sort(reverse=True)
+        return matches[0][1]
     return "local-default"
+
+
+ANALYZER_MODEL = "gemma4:e2b"
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+
+def smart_route(
+    messages: list[dict],
+    enabled_cartridges: dict[str, dict],
+) -> tuple[str, Optional[dict]]:
+    """
+    Analyze the prompt and pick the best cartridge.
+    Returns (cartridge_name, analysis_dict).
+    """
+    try:
+        analysis = analyze_prompt(
+            messages=messages,
+            ollama_base_url=OLLAMA_BASE_URL,
+            analyzer_model=ANALYZER_MODEL,
+            enabled_cartridges=enabled_cartridges,
+        )
+    except Exception as e:
+        print("Prompt analyzer failed, falling back to heuristic:", repr(e))
+        # Fallback: cloud if online, else local
+        if GROQ_API_KEY and check_online():
+            return "cloud-fast", None
+        return "local-default", None
+
+    # If analyzer directly recommends a valid cartridge, use it
+    rec = analysis.get("recommended_cartridge")
+    if rec and rec in enabled_cartridges:
+        return rec, analysis
+
+    # Filter cartridges by role match
+    preferred_roles = set(analysis.get("preferred_roles", ["general"]))
+    avoid_roles = set(analysis.get("avoid_roles", []))
+
+    candidates = []
+    for name, cart in enabled_cartridges.items():
+        cart_roles = set(cart.get("roles", []))
+        # Skip memory/classify-only cartridges
+        if cart_roles <= {"memory", "classify"}:
+            continue
+        # Skip if cartridge has avoided roles
+        if cart_roles & avoid_roles:
+            continue
+        # Must have at least one preferred role
+        if not (cart_roles & preferred_roles):
+            continue
+        # Skip online-required if offline
+        if cart.get("online_required") and not (GROQ_API_KEY and check_online()):
+            continue
+        candidates.append((cart.get("priority", 0), name))
+
+    if not candidates:
+        # No role match — pick best general cartridge
+        for name, cart in enabled_cartridges.items():
+            cart_roles = set(cart.get("roles", []))
+            if "general" in cart_roles and not cart.get("online_required"):
+                candidates.append((cart.get("priority", 0), name))
+
+    if candidates:
+        # If analyzer says needs_cloud, boost groq candidates
+        if analysis.get("needs_cloud") and GROQ_API_KEY and check_online():
+            boosted = []
+            for priority, name in candidates:
+                boost = 1000 if enabled_cartridges[name].get("provider") == "groq" else 0
+                boosted.append((priority + boost, name))
+            candidates = boosted
+
+        candidates.sort(reverse=True)
+        return candidates[0][1], analysis
+
+    return "local-default", analysis
 
 
 def save_turn_to_memory(
@@ -269,9 +364,17 @@ def health():
             "groq_model": GROQ_MODEL,
             "ollama_model": OLLAMA_MODEL,
             "memory_model": memory_engine.memory_model,
-            "cartridges": CARTRIDGES,
+            "cartridges": {
+                name: {"provider": c["provider"], "model": c["model"]}
+                for name, c in CARTRIDGES.items()
+            },
         }
     )
+
+
+@app.get("/cartridges")
+def cartridges_list():
+    return jsonify({"cartridges": CARTRIDGE_REGISTRY})
 
 
 @app.post("/chat")
@@ -288,7 +391,7 @@ def chat():
     try:
         augmented_messages, used_memories = inject_memory_into_messages(messages)
 
-        # explicit cartridge wins
+        # --- explicit cartridge wins ---
         if cartridge:
             content, provider, model = run_cartridge(cartridge, augmented_messages)
             save_turn_to_memory(messages, content, provider, model, cartridge)
@@ -302,36 +405,9 @@ def chat():
                 }
             )
 
-        # explicit provider modes
+        # --- explicit provider modes ---
         if mode == "groq":
-            content, provider, model = run_cartridge("cloud-fast", augmented_messages)
-            save_turn_to_memory(messages, content, provider, model, "cloud-fast")
-            return jsonify(
-                {
-                    "provider": provider,
-                    "model": model,
-                    "cartridge": "cloud-fast",
-                    "content": content,
-                    "used_memories": used_memories,
-                }
-            )
-
-        if mode == "ollama":
-            content, provider, model = run_cartridge("local-default", augmented_messages)
-            save_turn_to_memory(messages, content, provider, model, "local-default")
-            return jsonify(
-                {
-                    "provider": provider,
-                    "model": model,
-                    "cartridge": "local-default",
-                    "content": content,
-                    "used_memories": used_memories,
-                }
-            )
-
-        # auto mode
-        chosen = auto_route(messages)
-        try:
+            chosen = get_best_cartridge_for_provider("groq", CARTRIDGES)
             content, provider, model = run_cartridge(chosen, augmented_messages)
             save_turn_to_memory(messages, content, provider, model, chosen)
             return jsonify(
@@ -343,22 +419,53 @@ def chat():
                     "used_memories": used_memories,
                 }
             )
+
+        if mode == "ollama":
+            chosen = get_best_cartridge_for_provider("ollama", CARTRIDGES)
+            content, provider, model = run_cartridge(chosen, augmented_messages)
+            save_turn_to_memory(messages, content, provider, model, chosen)
+            return jsonify(
+                {
+                    "provider": provider,
+                    "model": model,
+                    "cartridge": chosen,
+                    "content": content,
+                    "used_memories": used_memories,
+                }
+            )
+
+        # --- auto mode: prompt analyzer + smart router ---
+        chosen, analysis = smart_route(messages, CARTRIDGES)
+        try:
+            content, provider, model = run_cartridge(chosen, augmented_messages)
+            save_turn_to_memory(messages, content, provider, model, chosen)
+            result = {
+                "provider": provider,
+                "model": model,
+                "cartridge": chosen,
+                "content": content,
+                "used_memories": used_memories,
+            }
+            if analysis:
+                result["analysis"] = analysis
+            return jsonify(result)
         except Exception as e:
             print(f"Primary cartridge failed ({chosen}):", repr(e))
 
             if chosen != "local-default":
                 content, provider, model = run_cartridge("local-default", augmented_messages)
                 save_turn_to_memory(messages, content, provider, model, "local-default")
-                return jsonify(
-                    {
-                        "provider": provider,
-                        "model": model,
-                        "cartridge": "local-default",
-                        "content": content,
-                        "fallback": True,
-                        "used_memories": used_memories,
-                    }
-                )
+                result = {
+                    "provider": provider,
+                    "model": model,
+                    "cartridge": "local-default",
+                    "content": content,
+                    "fallback": True,
+                    "used_memories": used_memories,
+                }
+                if analysis:
+                    result["analysis"] = analysis
+                return jsonify(result)
 
             raise
 
