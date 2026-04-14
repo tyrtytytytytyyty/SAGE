@@ -266,6 +266,7 @@ Rules:
                     {"role": "user", "content": prompt},
                 ],
                 "stream": False,
+                "format": "json",
                 "options": {
                     "num_ctx": 1024,
                     "temperature": 0.1,
@@ -276,6 +277,14 @@ Rules:
         response.raise_for_status()
         data = response.json()
         content = data.get("message", {}).get("content", "").strip()
+
+        # format: "json" should give us clean JSON, but fall back to extraction
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
 
         parsed = self._extract_json_object(content)
         if not parsed:
@@ -551,6 +560,7 @@ Rules:
                 if q in tags:
                     score += 1.0
 
+                r["_retrieval_score"] = score
                 scored.append((score, r))
             rows = [r for _, r in sorted(scored, key=lambda x: x[0], reverse=True)]
         else:
@@ -563,6 +573,7 @@ Rules:
         query_text: str,
         max_complexity: int = 2,
         limit: int = 8,
+        min_score: float = 0.15,
     ) -> list[str]:
         memories = self.retrieve_context(
             max_complexity=max_complexity,
@@ -571,11 +582,14 @@ Rules:
         )
         snippets = []
         for m in memories:
+            # Skip low-relevance memories to reduce prompt bloat
+            if m.get("_retrieval_score", 0) < min_score:
+                continue
+
             summary = m.get("summary_text")
             if summary:
-                snippets.append(summary)
+                snippets.append(f"[#{m['id']}] {summary}")
 
-            # mark access
             self.touch_memory(m["id"])
 
         return snippets
@@ -691,6 +705,7 @@ Use this schema exactly:
                     {"role": "user", "content": user_prompt},
                 ],
                 "stream": False,
+                "format": "json",
                 "options": {
                     "num_ctx": 1024,
                     "temperature": 0.1,
@@ -702,7 +717,12 @@ Use this schema exactly:
         data = response.json()
         content = data.get("message", {}).get("content", "").strip()
 
-        candidate = self._extract_json_object(content)
+        try:
+            candidate = json.loads(content)
+            if not isinstance(candidate, dict):
+                candidate = None
+        except Exception:
+            candidate = self._extract_json_object(content)
         if not candidate:
             raise RuntimeError("Could not parse edited memory into structured JSON.")
 
@@ -807,8 +827,12 @@ Use this schema exactly:
 # SIMPLE TEST HARNESS
 # ----------------------------
 if __name__ == "__main__":
+    import os as _os
+    _state_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "sage_state")
+    _os.makedirs(_state_dir, exist_ok=True)
+
     engine = MemoryEngine(
-        db_path="brain_storage.db",
+        db_path=_os.path.join(_state_dir, "brain_storage.db"),
         memory_model="gemma4:e2b",
     )
 
